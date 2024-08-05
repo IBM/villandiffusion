@@ -14,6 +14,7 @@
 
 core.*
 res*
+fres*
 tmp*
 *.out
 

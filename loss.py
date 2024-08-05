@@ -13,6 +13,7 @@ from matplotlib import pyplot as plt
 from dataset import Backdoor, DEFAULT_VMIN, DEFAULT_VMAX
 from model import DiffuserModelSched
 # from tmp_loss_sde import q_sample_diffuser_alt_half
+from util_fourier import filtered_by_freq
 
 """## Defining the forward diffusion process
 
@@ -1001,6 +1002,45 @@ class LossFn:
             # print(f"predicted_noise: {predicted_noise.shape}, {torch.isnan(predicted_noise).any()}, min: {predicted_noise.min()}, max: {predicted_noise.max()}")
             
             loss: torch.Tensor = self.__norm()(target=target, input=- predicted_noise * unqueeze_n(sigmas_t))
+            return loss.mean()
+        else:
+            raise NotImplementedError(f"sde_type: {self.__sde_type} isn't implemented")
+        
+    def p_loss_fourier_by_keys(self, batch, model: nn.Module, target_latent_key: torch.Tensor, poison_latent_key: torch.Tensor, timesteps: torch.Tensor, vae=None, noise: torch.Tensor=None, 
+                               weight_dtype: str=None, scaling_factor: float=None, thres: Union[int, float]=0.3, pass_type: str='high') -> torch.Tensor:
+        target_latents, poison_latents = LossFn.__get_latents(batch=batch, keys=[target_latent_key, poison_latent_key], vae=vae, weight_dtype=weight_dtype, scaling_factor=scaling_factor)
+        
+        return self.p_loss_fourier(model=model, x_start=target_latents, R=poison_latents, timesteps=timesteps, noise=noise, thres=thres, pass_type=pass_type)
+        
+    def p_loss_fourier(self, model: nn.Module, x_start: torch.Tensor, R: torch.Tensor, 
+               timesteps: torch.Tensor, noise: torch.Tensor=None, thres: Union[int, float]=0.3, pass_type: str='high') -> torch.Tensor:
+        if len(x_start) == 0: 
+            return 0
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        # noise = noise.clamp(-LossFn.RANDN_BOUND, LossFn.RANDN_BOUND)
+            
+        def unqueeze_n(x):
+            return x.reshape(len(x_start), *([1] * len(x_start.shape[1:])))  
+            
+        
+        # Main loss function
+        x_noisy, target = self.__get_inputs_targets(x_start=x_start, R=R, timesteps=timesteps, noise=noise)
+        
+        p = partial(filtered_by_freq, dim=list(range(len(x_noisy.shape)))[-2:], in_diamiter=0, out_diamiter=x_noisy.shape[-2] * thres)
+        
+        if self.__sde_type == DiffuserModelSched.SDE_VP or self.__sde_type == DiffuserModelSched.SDE_LDM:
+            predicted_noise = model(x_noisy.contiguous(), timesteps.contiguous(), return_dict=False)[0]
+            loss: torch.Tensor = self.__norm()(target=p(target), input=p(predicted_noise))
+            return loss.mean()
+        elif self.__sde_type == DiffuserModelSched.SDE_VE:
+            sigmas_t: torch.Tensor = self.__sigmas.to(timesteps.device)[timesteps]
+            predicted_noise = model(x_noisy.contiguous(), sigmas_t.contiguous(), return_dict=False)[0]
+            
+            # print(f"x_noisy: {x_noisy.shape}, {torch.isnan(x_noisy).any()}, min: {x_noisy.min()}, max: {x_noisy.max()}")
+            # print(f"predicted_noise: {predicted_noise.shape}, {torch.isnan(predicted_noise).any()}, min: {predicted_noise.min()}, max: {predicted_noise.max()}")
+            
+            loss: torch.Tensor = self.__norm()(target=p(target), input=p(- predicted_noise * unqueeze_n(sigmas_t)))
             return loss.mean()
         else:
             raise NotImplementedError(f"sde_type: {self.__sde_type} isn't implemented")

@@ -1,0 +1,1 @@
+python VillanDiffusion_fourier.py --project default --mode train+measure --dataset CELEBA-HQ --sde_type SDE-VP --sched UNIPC-SCHED --infer_steps 20 --batch 32 --epoch 50 --save_image_epochs 1 --save_model_epochs 1 --poison_rate 0.0 --trigger BOX_14 --target HAT --ckpt DDPM-CELEBA-HQ-256 --fclip o -o --gpu 0

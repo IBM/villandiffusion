@@ -157,6 +157,8 @@ class TrainingConfig:
     is_save_all_model_epochs: bool = DEFAULT_IS_SAVE_ALL_MODEL_EPOCHS
     sample_ep: int = DEFAULT_SAMPLE_EPOCH
     result: str = DEFAULT_RESULT
+    lora_rank: int = DEFAULT_LORA_RANK
+    lora_alpha: int = DEFAULT_LORA_ALPHA
     
     eval_sample_n: int = 16  # how many images to sample during evaluation
     # measure_sample_n: int = 1024
@@ -173,6 +175,7 @@ class TrainingConfig:
     lr_warmup_steps: int = 500
     # save_image_epochs: int = 1
     # mixed_precision: str = 'fp16'  # `no` for float32, `fp16` for automatic mixed precision
+    is_mixed_precision: bool = False
     mixed_precision: str = 'no'  # `no` for float32, `fp16` for automatic mixed precision
 
     push_to_hub: bool = False  # whether to upload the saved model to the HF Hub
@@ -182,9 +185,11 @@ class TrainingConfig:
     dataset_path: str = 'datasets'
     ckpt_dir: str = 'ckpt'
     data_ckpt_dir: str = 'data.ckpt'
+    lora_dir: str = 'lora'
     ep_model_dir: str = 'epochs'
     ckpt_path: str = None
     data_ckpt_path: str = None
+    lora_path: str = None
     # hub_token = "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"
 
 def naming_fn(config: TrainingConfig):
@@ -262,10 +267,11 @@ def setup():
         setattr(config, "clip", None)
         
     # Mixed Precision Options
-    if config.sde_type == "SDE-VP" or config.sde_type == "SDE-LDM":
-        config.mixed_precision = 'fp16'
-    elif config.sde_type == "SDE-VE":
-        config.mixed_precision = 'no'
+    if config.is_mixed_precision:
+        if config.sde_type == "SDE-VP" or config.sde_type == "SDE-LDM":
+            config.mixed_precision = 'fp16'
+        elif config.sde_type == "SDE-VE":
+            config.mixed_precision = 'no'
     # Determine gradient accumulation & Learning Rate
     bs = 0
     if config.dataset in [DatasetLoader.CIFAR10, DatasetLoader.MNIST, DatasetLoader.CELEBA_HQ_LATENT_PR05, DatasetLoader.CELEBA_HQ_LATENT]:
@@ -317,6 +323,8 @@ def setup():
         config.ckpt_path = os.path.join(config.output_dir, config.ckpt_dir)
         config.data_ckpt_path = os.path.join(config.output_dir, config.data_ckpt_dir)
         os.makedirs(config.ckpt_path, exist_ok=True)
+    config.lora_path = os.path.join(config.output_dir, config.lora_dir)
+    os.makedirs(config.lora_path, exist_ok=True)
     
     name_id = str(config.output_dir).split('/')[-1]
     wandb.init(project=config.project, name=name_id, id=name_id, settings=wandb.Settings(start_method="fork"))
@@ -340,11 +348,16 @@ from accelerate import Accelerator
 from tqdm.auto import tqdm
 import lpips
 from datasets import Dataset
+from peft import LoraConfig
+from peft.utils import get_peft_model_state_dict
 
 from fid_score import fid
 
 from diffusers import DDPMPipeline
 from diffusers.optimization import get_cosine_schedule_with_warmup
+from diffusers.utils import convert_state_dict_to_diffusers
+# from diffusers.utils import check_min_version, convert_state_dict_to_diffusers, is_wandb_available
+from diffusers.utils.torch_utils import is_compiled_module
 
 from model import DiffuserModelSched, batch_sampling, batch_sampling_save
 from util import Samples, MemoryLog, Log, batchify, match_count
@@ -440,7 +453,7 @@ def get_model_optim_sched(config: TrainingConfig, accelerator: Accelerator, data
         # optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     
     # model, noise_sched, get_pipeline = DiffuserModelSched.get_model_sched(image_size=image_size, channels=channel, ckpt=DiffuserModelSched.NCSNPP_32_DEFAULT, clip_sample=config.clip, noise_sched_type=config.sched, sde_type=config.sde_type)
-    
+    print(f"get_model_optim_sched/lora_layers: {lora_layers}")
     # IMPORTANT: Optimizer must be placed after nn.DataParallel because it needs to record parallel weights. If not, it cannot load_state properly.
     model = nn.DataParallel(model, device_ids=config.device_ids)
     if vae is not None:
@@ -450,6 +463,7 @@ def get_model_optim_sched(config: TrainingConfig, accelerator: Accelerator, data
     if lora_layers is None:
         optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     else:
+        print(f"lora_layers: {lora_layers}")
         optimizer = torch.optim.Adam(lora_layers, lr=config.learning_rate)
     lr_sched = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
@@ -512,7 +526,7 @@ def init_train(config: TrainingConfig, dataset_loader: DatasetLoader):
         mixed_precision=config.mixed_precision,
         gradient_accumulation_steps=config.gradient_accumulation_steps, 
         log_with="wandb",
-        logging_dir=os.path.join(config.output_dir, "logs")
+        project_dir=os.path.join(config.output_dir, "logs")
     )
     
     accelerator = get_accelerator(config=config)
@@ -625,6 +639,8 @@ def sampling(config: TrainingConfig, file_name: Union[int, str], pipeline):
             raise TypeError(f"Argument 'file_name' should be string nor integer.")
     
     with torch.no_grad():
+        if config.lora_alpha is not None and config.lora_rank is not None:
+            pipeline = load_lora(pipeline=pipeline, save_path=config.lora_path)
         print(f"Sampling Init Noise -Sample_n: {config.eval_sample_n}, Channel: {pipeline.unet.in_channels}, Sample_size: {pipeline.unet.sample_size}")
         noise = torch.randn(
                     (config.eval_sample_n, pipeline.unet.in_channels, pipeline.unet.sample_size, pipeline.unet.sample_size),
@@ -1061,6 +1077,9 @@ def measure(config: TrainingConfig, accelerator: Accelerator, dataset_loader: Da
             )
     backdoor_noise = noise + pipeline.encode(dataset_loader.trigger.unsqueeze(0)).to(noise.device)
     
+    if config.lora_alpha is not None and config.lora_rank is not None:
+        pipeline = load_lora(pipeline=pipeline, save_path=config.output_dir)
+    
     if config.task != TASK_GENERATE:
         mse_sc, ssim_sc, lpips_sc = measure_inpaints(config=config, pipeline=pipeline, dsl=dataset_loader)
         print(f"{config.task} - LPIPS: {lpips_sc}, MSE: {mse_sc}, SSIM: {ssim_sc}")
@@ -1108,13 +1127,44 @@ def measure(config: TrainingConfig, accelerator: Accelerator, dataset_loader: Da
 def get_ep_model_path(config: TrainingConfig, dir: Union[str, os.PathLike], epoch: int):
     return os.path.join(dir, config.ep_model_dir, f"ep{epoch}")
 
-def checkpoint(config: TrainingConfig, accelerator: Accelerator, pipeline, cur_epoch: int, cur_step: int, repo=None, commit_msg: str=None):
+
+def unwrap_model(model):
+    model = accelerator.unwrap_model(model)
+    model = model._orig_mod if is_compiled_module(model) else model
+    return model
+
+def save_lora(pipeline, save_path: str, unet=None):
+    if unet is not None:
+        unwrapped_unet = unwrap_model(unet)
+    else:
+        unwrapped_unet = unwrap_model(pipeline.unet)
+    unet_lora_state_dict = convert_state_dict_to_diffusers(
+        get_peft_model_state_dict(unwrapped_unet)
+    )
+
+    pipeline.save_lora_weights(
+        save_directory=save_path,
+        unet_lora_layers=unet_lora_state_dict,
+        safe_serialization=True,
+    )
+    
+def load_lora(pipeline, save_path: str, none_ok: bool=True):
+    if len(os.listdir(save_path)) > 0:
+        pipeline.load_lora_weights(save_path)
+    elif not none_ok:
+        raise ValueError(f"Cannot load LoRA module under the path, {save_path}")
+        
+    return pipeline
+
+def checkpoint(config: TrainingConfig, accelerator: Accelerator, pipeline, cur_epoch: int, cur_step: int, repo=None, commit_msg: str=None, unet=None):
     accelerator.save_state(config.ckpt_path)
     accelerator.save({'epoch': cur_epoch, 'step': cur_step}, config.data_ckpt_path)
     # if config.push_to_hub:
     #     push_to_hub(config, pipeline, repo, commit_message=commit_msg, blocking=True)
     # else:
     pipeline.save_pretrained(config.output_dir)
+    if config.lora_alpha is not None and config.lora_rank is not None:
+        save_lora(pipeline=pipeline, save_path=config.lora_path, unet=unet)
         
     if config.is_save_all_model_epochs:
         # ep_model_path = os.path.join(config.output_dir, config.ep_model_dir, f"ep{cur_epoch}")
@@ -1125,9 +1175,7 @@ def checkpoint(config: TrainingConfig, accelerator: Accelerator, pipeline, cur_e
 def train_loop(config: TrainingConfig, accelerator: Accelerator, repo, model: nn.Module, get_pipeline, noise_sched, optimizer: torch.optim, loader, lr_sched, vae=None, lora_layers=None, start_epoch: int=0, start_step: int=0):
     weight_dtype: str = None
     scaling_factor: float = 1.0
-    model.requires_grad_(True)
-    if vae != None:
-        vae.requires_grad_(False)
+    
     try:
         # memlog = MemoryLog('memlog.log')
         cur_step = start_step
@@ -1139,6 +1187,8 @@ def train_loop(config: TrainingConfig, accelerator: Accelerator, repo, model: nn
         # pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)        
         pipeline = get_pipeline(accelerator, model, vae, noise_sched)
         sampling(config, 0, pipeline)
+        
+        checkpoint(config=config, accelerator=accelerator, pipeline=pipeline, cur_epoch=epoch, cur_step=cur_step, repo=repo, commit_msg=f"Epoch {epoch}", unet=model)
 
         # clean_model = copy.deepcopy(model).eval()
         # Now you train the model
@@ -1164,14 +1214,19 @@ def train_loop(config: TrainingConfig, accelerator: Accelerator, repo, model: nn
                 with accelerator.accumulate(model):
                     # Predict the noise residual
                     # loss = p_losses_diffuser(noise_sched, model=model, sde_type=config.sde_type, x_start=target_images, R=clean_images, timesteps=timesteps, noise=noise, loss_type="l2", psi=config.psi, solver_type=config.solver_type, vp_scale=config.vp_scale, ve_scale=config.ve_scale)
-                    loss = loss_fn.p_loss_by_keys(batch=batch, model=model, vae=None, target_latent_key="target", poison_latent_key="pixel_values", timesteps=timesteps, noise=None, weight_dtype=weight_dtype, scaling_factor=scaling_factor)
+                    # loss = loss_fn.p_loss_by_keys(batch=batch, model=model, vae=None, target_latent_key="target", poison_latent_key="pixel_values", timesteps=timesteps, noise=None, weight_dtype=weight_dtype, scaling_factor=scaling_factor)
+                    loss = loss_fn.p_loss_fourier_by_keys(batch=batch, model=model, vae=None, target_latent_key="target", poison_latent_key="pixel_values", timesteps=timesteps, noise=None, weight_dtype=weight_dtype, scaling_factor=scaling_factor)
+                    
                     # loss = loss_fn.p_loss(model=model, x_start=target_images, R=clean_images, timesteps=timesteps, noise=noise)
                     # loss = adaptive_score_loss(noise_sched, backdoor_model=model, clean_model=clean_model, x_start=target_images, R=clean_images, timesteps=timesteps, noise=noise, loss_type="l2")
                     accelerator.backward(loss)
                     
                     # clip_grad_norm_: https://huggingface.co/docs/accelerate/v0.13.2/en/package_reference/accelerator#accelerate.Accelerator.clip_grad_norm_
                     if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                        if lora_layers is None:
+                            accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                        else:
+                            accelerator.clip_grad_norm_(lora_layers, 1.0)
                     optimizer.step()
                     lr_sched.step()
                     optimizer.zero_grad()
@@ -1192,7 +1247,7 @@ def train_loop(config: TrainingConfig, accelerator: Accelerator, repo, model: nn
                     sampling(config, epoch, pipeline)
 
                 if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.epoch - 1:
-                    checkpoint(config=config, accelerator=accelerator, pipeline=pipeline, cur_epoch=epoch, cur_step=cur_step, repo=repo, commit_msg=f"Epoch {epoch}")
+                    checkpoint(config=config, accelerator=accelerator, pipeline=pipeline, cur_epoch=epoch, cur_step=cur_step, repo=repo, commit_msg=f"Epoch {epoch}", unet=model)
             # memlog.append()
     except:
         Log.error("Training process is interrupted by an error")
@@ -1203,7 +1258,7 @@ def train_loop(config: TrainingConfig, accelerator: Accelerator, repo, model: nn
         # Log.info("Save model and sample images")
         pipeline = get_pipeline(accelerator, model, vae, noise_sched)
         if accelerator.is_main_process:
-            checkpoint(config=config, accelerator=accelerator, pipeline=pipeline, cur_epoch=epoch, cur_step=cur_step, repo=repo, commit_msg=f"Epoch {epoch}")
+            checkpoint(config=config, accelerator=accelerator, pipeline=pipeline, cur_epoch=epoch, cur_step=cur_step, repo=repo, commit_msg=f"Epoch {epoch}", unet=model)
             sampling(config, 'final', pipeline)
     return get_pipeline(accelerator, model, vae, noise_sched)
 
