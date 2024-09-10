@@ -39,9 +39,9 @@ wandb login --relogin --cloud <API Key>
 
 ### Pre-Trained Models
 
-I've uploaded all pre-trained backdoor diffusion models for [BadDiffusion](https://github.com/IBM/BadDiffusion) and [VillanDiffusion](https://github.com/IBM/VillanDiffusion) on [HuggingFace](https://huggingface.co/newsyctw). Please feel free to download backdoored diffusion models from it.
+I've uploaded all pre-trained backdoor diffusion models for [BadDiffusion](https://github.com/IBM/BadDiffusion) and [VillanDiffusion](https://github.com/IBM/VillanDiffusion) on [HuggingFace](https://huggingface.co/FrankCCCCC). Please feel free to download backdoored diffusion models from it.
 
-Note that for training backdoor score-based models, you need to download the pre-trained clean model from [HuggingFace](https://huggingface.co/newsyctw/NCSN_CIFAR10_my) and put it under the working directory.
+Note that for training backdoor score-based models, you need to download the pre-trained clean model from [HuggingFace](https://huggingface.co/FrankCCCCC/NCSN_CIFAR10_my) and put it under the working directory.
 
 ### Backdoor Unconditional Diffusion Models with VillanDiffusion
 
